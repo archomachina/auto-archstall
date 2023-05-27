@@ -1,0 +1,139 @@
+
+#!/bin/bash
+
+# Check if the system is running in UEFI mode
+if [[ "$(efibootmgr | grep -c "BootCurrent: 0000")" -eq 0 ]]; then
+  echo "This system is not running in UEFI mode. Please boot into UEFI mode before running this script."
+  exit 1
+fi
+
+# Get the list of drives
+drives=($(lsblk -rno NAME,TYPE | awk '$2=="disk"{print $1}'))
+
+# Select the first drive
+drive=${drives[0]}
+
+# Create a new partition table
+parted -s /dev/${drive} mklabel gpt
+
+# Create a new partition
+parted -s /dev/${drive} mkpart primary btrfs 1MiB 100%
+
+# Set the partition type to "Linux"
+parted -s /dev/${drive} set 1 esp on
+
+# Create a new Btrfs file system
+mkfs.btrfs -f /dev/${drive}1
+
+# Mount the Btrfs file system
+mount /dev/${drive}1 /mnt
+
+# Enable zram
+echo "zram_enabled=1" > /etc/sysctl.d/99-zram.conf
+echo "zram_compression=zstd" >> /etc/sysctl.d/99-zram.conf
+sysctl --system
+
+# Set the zram size to half of the RAM
+zram_size=$(free -h | awk '/Mem:/{print $2}')/2
+echo "zram_size=${zram_size}" >> /etc/sysctl.d/99-zram.conf
+sysctl --system
+
+# Detect the CPU
+cpu_model=$(lscpu | awk -F ': ' '/Model name/ {print $2}')
+
+# Install the microcode for the CPU
+if [[ $cpu_model == *"Intel"* ]]; then
+  pacman -S intel-ucode
+elif [[ $cpu_model == *"AMD"* ]]; then
+  pacman -S amd-ucode
+fi
+
+# Detect the GPU
+gpu_model=$(lspci -k | awk -F ': ' '/VGA compatible controller/ {print $2}')
+
+# Install the driver for the GPU
+if [[ $gpu_model == *"NVIDIA"* ]]; then
+  pacman -S nvidia nvidia-utils
+elif [[ $gpu_model == *"AMD"* ]]; then
+  pacman -S xf86-video-amdgpu
+fi
+
+# Install systemd-boot
+bootctl install
+
+# Create a list of packages to install
+packages=(
+  base
+  base-devel
+  btrfs-progs
+  zram-tools
+  flatpak
+  dolphin
+  kate
+  kdenlive
+  k3b
+  vlc
+  networkmanager
+  bluetooth
+  cups
+  plasma-desktop  # KDE Plasma desktop environment
+  discover        # Discover software manager
+)
+
+# Prompt the user to choose additional packages
+read -p "Do you want to install additional packages? (y/n): " answer
+if [[ $answer =~ [Yy] ]]; then
+  read -p "Enter space-separated list of packages to install: " extra_packages
+  packages+=($extra_packages)
+fi
+
+# Install the packages
+pacman -S "${packages[@]}"
+
+# Disable unused services
+services=(
+  NetworkManager
+  bluetooth
+  cups
+)
+
+for service in "${services[@]}"; do
+  systemctl disable $service
+done
+
+# Enable auto background apps sleep
+systemctl enable tlp.service
+
+# Configure Flatpak
+flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+
+# Locale configuration and generation
+echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
+locale-gen
+
+# Update mirrors for optimal speed
+cp /etc/pacman.d/mirrorlist /etc/pacman.d/mirrorlist.backup
+rankmirrors -n 6 /etc/pacman.d/mirrorlist.backup > /etc/pacman.d/mirrorlist
+
+# Update the system
+pacman -Syu
+
+# Install Linux-Btrfs kernel
+pacman -S linux-btrfs
+
+# Configure systemd-boot
+bootctl install
+
+# Create the boot entry
+echo "default arch" > /boot/loader/loader.conf
+echo "timeout 3" >> /boot/loader/loader.conf
+echo "console-mode max" >> /boot/loader/loader.conf
+
+echo "title Arch Linux" > /boot/loader/entries/arch.conf
+echo "linux /vmlinuz-linux-btrfs" >> /boot/loader/entries/arch.conf
+echo "initrd /intel-ucode.img" >> /boot/loader/entries/arch.conf
+echo "initrd /initramfs-linux-btrfs.img" >> /boot/loader/entries/arch.conf
+echo "options root=UUID=$(blkid -s UUID -o value /dev/${drive}1) rw" >> /boot/loader/entries/arch.conf
+
+# Reboot the system
+reboot
